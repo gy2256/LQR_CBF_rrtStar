@@ -11,7 +11,7 @@ import pathlib
 sys.path.append(str(pathlib.Path(__file__).parent.parent))
 import env, plotting, utils, Queue
 # from LQR_planning import LQRPlanner
-from LQR_nonlinear_planning import LQRPlanner
+from LQR_nonlinear_unicycle_planning import LQRPlanner
 
 import copy
 import time
