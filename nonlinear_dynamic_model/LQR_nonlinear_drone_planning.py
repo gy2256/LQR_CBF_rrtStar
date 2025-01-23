@@ -11,10 +11,11 @@ import sys
 
 sys.path.append(str(pathlib.Path(__file__).parent.parent))
 from CBFsteer import CBF_RRT
-import env, plotting, utils
+import env, plotting
 
 
 from scipy.integrate import odeint
+from utils import Utils
 from scipy.linalg import solve_continuous_are
 
 SHOW_ANIMATION = False
@@ -33,11 +34,11 @@ class LQRPlanner:
 
         self.N = 12  # number of state variables
         self.M = 4  # number of control variables
-        self.DT = 0.1  # discretization step
+        self.DT = 0.02  # discretization step
 
-        self.MAX_TIME = 2.5  # Maximum simulation time
+        self.MAX_TIME = 5.0  # Maximum simulation time
         self.GOAL_DIST = 0.5
-        self.MAX_ITER = 10
+        self.MAX_STEPS = 500
         self.EPS = 0.01
 
         # initialize CBF
@@ -58,17 +59,10 @@ class LQRPlanner:
         I_xx = 16.571710e-6  # Moment of inertia around x-axis
         I_yy = 16.655602e-6  # Moment of inertia around y-axis
         I_zz = 29.261652e-6  # Moment of inertia around z-axis
-        '''
 
-        m = 0.068  # mass in kg
-        g = 9.81  # gravity
-        I_xx = 6.89e-5  # Moment of inertia around x-axis
-        I_yy = 6.89e-5  # Moment of inertia around y-axis
-        I_zz = 1.366e-4  # Moment of inertia around z-axis
-        '''
         u = args
         x1, x2, y1, y2, z1, z2, phi1, phi2, theta1, theta2, psi1, psi2 = x.reshape(-1).tolist()
-        #ft, tau_x, tau_y, tau_z = u.reshape(-1).tolist() # ft:trust in z, tau: moment in x,y,z
+
         # uppack control
         ft = u[0][0]
         tau_x = u[1][0]
@@ -96,6 +90,8 @@ class LQRPlanner:
         # Drones with 12 dimensions, current_state is the state of the drone at tk,
         # goal_state is the local goal needs to be reached
 
+        state_trajectory = np.array(current_state).reshape(self.N,1)
+
 
         # crazyflie
         m = 0.028  # mass in kg
@@ -108,6 +104,7 @@ class LQRPlanner:
         xd = np.array(goal_state).reshape(self.N, 1)
         ud = np.matrix([[m*g], [0], [0], [0]])
 
+        control_trajectory = np.array(ud).reshape(self.M,1)
         # Crazyflie reference
         # https://www.bitcraze.io/documentation/repository/crazyflie-firmware/master/api/params/#cppmrateroll
 
@@ -125,22 +122,26 @@ class LQRPlanner:
         moment_x_max, moment_y_max = (0.6/4)*0.046, (0.6/4)*0.046
 
         # Q weight matrix obtained from Bryson's rule
-        Q = np.array([
-            [1/(0.05*x_max**2), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # x
-            [0, 1/(0.05*vx_max**2), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # vx
-            [0, 0, 1/(0.05*y_max**2), 0, 0, 0, 0, 0, 0, 0, 0, 0],  # y
-            [0, 0, 0, 1/(0.05*vy_max**2), 0, 0, 0, 0, 0, 0, 0, 0],  # vy
-            [0, 0, 0, 0, 10/(0.05*z_max**2), 0, 0, 0, 0, 0, 0, 0],  # z
-            [0, 0, 0, 0, 0, 1/(0.05*vz_max**2), 0, 0, 0, 0, 0, 0],  # vz
-            [0, 0, 0, 0, 0, 0, 1/(0.05*phi_max**2), 0, 0, 0, 0, 0],  # phi
-            [0, 0, 0, 0, 0, 0, 0, 1/(0.05*phidot_max**2), 0, 0, 0, 0],  # phidot
-            [0, 0, 0, 0, 0, 0, 0, 0, 1/(0.05*theta_max**2), 0, 0, 0],  # theta
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 1/(0.05*thetadot_max**2), 0, 0],  # thetadot
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1/(0.05*psi_max**2), 0],  # psi
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1/(0.05*psidot_max**2)]  # psidot
-        ])
 
-        R = np.diag([1/(f_max**2), 1/(moment_x_max**2), 1/(moment_y_max**2), 1/(moment_z_max**2)])
+        Q = np.array([
+            [1 / (0.25** 2), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # x
+            [0, 1 / ((0.2 * vx_max) ** 2), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # vx
+            [0, 0, 1 / (0.25 ** 2), 0, 0, 0, 0, 0, 0, 0, 0, 0],  # y
+            [0, 0, 0, 1 / ((0.2 * vy_max) ** 2), 0, 0, 0, 0, 0, 0, 0, 0],  # vy
+            [0, 0, 0, 0, 1 / (0.25 ** 2), 0, 0, 0, 0, 0, 0, 0],  # z
+            [0, 0, 0, 0, 0, 1 / ((0.2 * vz_max) ** 2), 0, 0, 0, 0, 0, 0],  # vz
+            [0, 0, 0, 0, 0, 0, 1 / (( phi_max) ** 2), 0, 0, 0, 0, 0],  # phi
+            [0, 0, 0, 0, 0, 0, 0, 1 / ((0.1 * phidot_max) ** 2), 0, 0, 0, 0],  # phidot
+            [0, 0, 0, 0, 0, 0, 0, 0, 1 / ((theta_max) ** 2), 0, 0, 0],  # theta
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 1 / ((0.1 * thetadot_max) ** 2), 0, 0],  # thetadot
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 / ((psi_max) ** 2), 0],  # psi
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 / ((0.1 * psidot_max) ** 2)]  # psidot
+        ])
+        '''
+        Q = np.diag([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
+        '''
+        R = np.diag([1/((0.05*f_max)**2), 1/((0.05*moment_x_max)**2), 1/((0.05*moment_y_max)**2), 1/((0.05*moment_z_max)**2)])
+
 
         # A matrix (12x12)
         A = np.array([
@@ -176,9 +177,6 @@ class LQRPlanner:
 
 
         self.K, _, _ = control.lqr(A, B, Q, R)
-        #discrete_system = control.ss(A, B, np.eye(12), np.zeros((12, 4)), self.DT)
-        #self.K, _, _ = control.dlqr(discrete_system.A, discrete_system.B, Q, R)
-        #self.K, _, _ = control.lqr(A, B, Q, R)
 
         rx, ry, rz = [xk[0,0]], [xk[2,0]], [xk[4,0]]
 
@@ -187,12 +185,11 @@ class LQRPlanner:
         found_path = False
 
         time = 0.0
-        while time <= self.MAX_TIME:
-            time += self.DT
+        time_step = 0
+        while time_step <= self.MAX_STEPS:
 
             x_error = xk - xd
-            u = -self.K @ x_error + np.array([[m*g],[0],[0],[0]])
-            #u = np.array([[m*g+1.0],[0],[0],[0]])
+            u = -self.K @ x_error + np.array(ud).reshape(self.M,1)
 
             # check if LQR control is safe with respect to CBF constraint
             '''
@@ -201,13 +198,19 @@ class LQRPlanner:
                                                              system_type="unicycle_velocity_control"):
                     break
             '''
-            #u_clipped = np.clip(u, -np.array([[f_max], [moment_x_max], [moment_y_max], [moment_z_max]]),
-            #                    np.array([[f_max], [moment_x_max], [moment_y_max], [moment_z_max]]))
-            # Intergrate the nonlinear dynamics
 
-            #print(odeint(self.drone_nonlinear, xk_rollout, [0, self.DT], args=(u,)))
+            # Intergrate the nonlinear dynamics
             xk = odeint(self.drone_nonlinear, xk.reshape(-1), [0, self.DT], args=(u,))[-1].reshape(-1, 1)
 
+            # Normalize angle between -pi and pi
+            #xk[6, 0] = Utils.normalize_angle(xk[6,0])
+            #xk[8, 0] = Utils.normalize_angle(xk[8,0])
+            #xk[10, 0] = Utils.normalize_angle(xk[10,0])
+
+            control_trajectory = np.hstack((control_trajectory, u.reshape(self.M,1)))
+            state_trajectory = np.hstack((state_trajectory, xk.reshape(self.N,1)))
+            time += self.DT
+            time_step += 1
 
             rx.append(xk[0, 0])
             ry.append(xk[2, 0])
@@ -237,35 +240,8 @@ class LQRPlanner:
             # print("Cannot found path")
             return rx, ry, rz, error, found_path
 
-        return rx, ry, rz, error, found_path
+        return rx, ry, rz, error, state_trajectory, found_path
 
-    def dLQR(self, A, B, Q, R):
-
-        N = 50
-
-        # Create a list of N + 1 elements
-        P = [None] * (N + 1)
-
-        Qf = Q
-
-        # LQR via Dynamic Programming
-        P[N] = Qf
-
-        # For i = N, ..., 1
-        for i in range(N, 0, -1):
-            # state cost matrix
-            P[i - 1] = Q + A.T @ P[i] @ A - (A.T @ P[i] @ B) @ np.linalg.pinv(
-                R + B.T @ P[i] @ B) @ (B.T @ P[i] @ A)
-
-            # Create a list of N elements
-        K = [None] * N
-        u = [None] * N
-
-        P1 = P[N - 1]
-
-        K1 = -np.linalg.inv(R + B.T @ P[N] @ B) @ B.T @ P[N] @ A
-
-        return K1
 
     def get_linear_model(self, x_bar, u_bar):
         """
@@ -375,11 +351,11 @@ class LQRPlanner:
 def main():
     print(__file__ + " start!!")
 
-    max_steps = 10
+    max_steps = 100
 
-    gx = 0.3
-    gy = 0.2
-    gz = 1.5
+    gx = 1.0
+    gy = 0.5
+    gz = 1.2
 
 
     lqr_planner = LQRPlanner()
@@ -394,13 +370,16 @@ def main():
     print("goal", gy, gx, gz)
 
 
-    rx, ry, rz, error, foundpath = lqr_planner.lqr_planning(initial_state, goal_state, LQR_gain=None, test_LQR=True,
+    rx, ry, rz, error, state_traj, foundpath = lqr_planner.lqr_planning(initial_state, goal_state, LQR_gain=None, test_LQR=True,
                                                                 show_animation=SHOW_ANIMATION)
 
 
     print("time of running LQR: ", time.time() - start_time)
     print("Found path: ", foundpath)
 
+
+    
+    
     ax = plt.axes(projection='3d')
     ax.plot(sx, sy, sz, "or")
     ax.plot(gx, gy, gz, "ob")
@@ -411,7 +390,18 @@ def main():
     ax.set_xlim(-1.5, 2.5)
     ax.set_ylim(-2.5, 2.5)
     ax.set_zlim(-5, 5)
+
     plt.show()
+    '''
+
+    ax = plt.axes()
+    t = np.linspace(0, lqr_planner.MAX_TIME, len(rx))
+    ax.plot(t, rx, label="x")
+    ax.plot(t, ry, label="y")
+    ax.plot(t, rz, label="z")
+    plt.show()
+
+    '''
 
     '''
         
