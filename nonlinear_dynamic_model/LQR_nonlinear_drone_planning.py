@@ -1,427 +1,185 @@
-import math
-import matplotlib.pyplot as plt
 import numpy as np
-import control
-
-import time
-
-import pathlib
-import sys
-
-
-sys.path.append(str(pathlib.Path(__file__).parent.parent))
-from CBFsteer import CBF_RRT
-import env, plotting
-
-
 from scipy.integrate import odeint
-from utils import Utils
-from scipy.linalg import solve_continuous_are
-
-SHOW_ANIMATION = False
-
-
-class LQRPlanner:
-
-    def __init__(self):
-        '''
-        Create planner for quadcotpers
-
-        TO DO: (1) 3d LQR Planning on linearized drone dynamics
-               (2) CBF with linearized drone dynamcis
-               (3) intergrate with MPC (Could be linear or nonlinear)
-        '''
-
-        self.N = 12  # number of state variables
-        self.M = 4  # number of control variables
-        self.DT = 0.02  # discretization step
-
-        self.MAX_TIME = 5.0  # Maximum simulation time
-        self.GOAL_DIST = 0.5
-        self.MAX_STEPS = 500
-        self.EPS = 0.01
-
-        # initialize CBF
-        self.env = env.Env()
-        #self.obs_circle = self.env.obs_circle
-        #self.obs_rectangle = self.env.obs_rectangle
-        self.obs_sphere = []
-        self.obs_box = [] # fourth order poly-nomial approximation
-        self.obs_boundary = self.env.obs_boundary
-
-        #self.cbf_rrt_simulation = CBF_RRT(self.obs_circle)
-
-    def drone_nonlinear(self, x, t, args=None):
-        # Drone parameters
-
-        m = 0.028  # mass in kg
-        g = 9.81  # gravity
-        I_xx = 16.571710e-6  # Moment of inertia around x-axis
-        I_yy = 16.655602e-6  # Moment of inertia around y-axis
-        I_zz = 29.261652e-6  # Moment of inertia around z-axis
-
-        u = args
-        x1, x2, y1, y2, z1, z2, phi1, phi2, theta1, theta2, psi1, psi2 = x.reshape(-1).tolist()
-
-        # uppack control
-        ft = u[0][0]
-        tau_x = u[1][0]
-        tau_y = u[2][0]
-        tau_z = u[3][0]
-
-        dot_x1 = x2
-        dot_x2 = ft / m * (np.sin(phi1) * np.sin(psi1) + np.cos(phi1) * np.cos(psi1) * np.sin(theta1))
-        dot_y1 = y2
-        dot_y2 = ft / m * (np.cos(phi1) * np.sin(psi1) * np.sin(theta1) - np.cos(psi1) * np.sin(phi1))
-        dot_z1 = z2
-        dot_z2 = -g + ft / m * np.cos(phi1) * np.cos(theta1)
-        dot_phi1 = phi2
-        dot_phi2 = (I_yy - I_zz) / I_xx * theta2 * psi2 + tau_x / I_xx
-        dot_theta1 = theta2
-        dot_theta2 = (I_zz - I_xx) / I_yy * phi2 * psi2 + tau_y / I_yy
-        dot_psi1 = psi2
-        dot_psi2 = (I_xx - I_yy) / I_zz * phi2 * theta2 + tau_z / I_zz
-
-        return [dot_x1, dot_x2, dot_y1, dot_y2, dot_z1, dot_z2, dot_phi1, dot_phi2, dot_theta1, dot_theta2, dot_psi1, dot_psi2]
-
-    def lqr_planning(self, current_state, goal_state, LQR_gain=None, test_LQR=False, show_animation=True, cbf_check=False,
-                     solve_QP=False):
-
-        # Drones with 12 dimensions, current_state is the state of the drone at tk,
-        # goal_state is the local goal needs to be reached
-
-        state_trajectory = np.array(current_state).reshape(self.N,1)
-
-
-        # crazyflie
-        m = 0.028  # mass in kg
-        g = 9.81  # gravity
-        I_xx = 16.571710e-6  # Moment of inertia around x-axis
-        I_yy = 16.655602e-6  # Moment of inertia around y-axis
-        I_zz = 29.261652e-6  # Moment of inertia around z-axis
-
-        xk = np.array(current_state).reshape(self.N, 1)
-        xd = np.array(goal_state).reshape(self.N, 1)
-        ud = np.matrix([[m*g], [0], [0], [0]])
-
-        control_trajectory = np.array(ud).reshape(self.M,1)
-        # Crazyflie reference
-        # https://www.bitcraze.io/documentation/repository/crazyflie-firmware/master/api/params/#cppmrateroll
-
-        # Caterteian position constraint
-        x_max, y_max, z_max = 1.5, 1.5, 1.5
-        vx_max, vy_max, vz_max = 1.0, 1.0, 1.0
-
-        # Attitude constraint
-        phi_max, theta_max, psi_max = np.pi/4, np.pi/4, np.pi/2
-        phidot_max, thetadot_max, psidot_max = np.pi*4, np.pi*4, np.pi*2.22
-
-        # Control constraint
-        f_max = 0.6 # N
-        moment_z_max =  (0.005964552 * (0.6/4) + 1.563383e-5)*4
-        moment_x_max, moment_y_max = (0.6/4)*0.046, (0.6/4)*0.046
-
-        # Q weight matrix obtained from Bryson's rule
-
-        Q = np.array([
-            [1 / (0.25** 2), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # x
-            [0, 1 / ((0.2 * vx_max) ** 2), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # vx
-            [0, 0, 1 / (0.25 ** 2), 0, 0, 0, 0, 0, 0, 0, 0, 0],  # y
-            [0, 0, 0, 1 / ((0.2 * vy_max) ** 2), 0, 0, 0, 0, 0, 0, 0, 0],  # vy
-            [0, 0, 0, 0, 1 / (0.25 ** 2), 0, 0, 0, 0, 0, 0, 0],  # z
-            [0, 0, 0, 0, 0, 1 / ((0.2 * vz_max) ** 2), 0, 0, 0, 0, 0, 0],  # vz
-            [0, 0, 0, 0, 0, 0, 1 / (( phi_max) ** 2), 0, 0, 0, 0, 0],  # phi
-            [0, 0, 0, 0, 0, 0, 0, 1 / ((0.1 * phidot_max) ** 2), 0, 0, 0, 0],  # phidot
-            [0, 0, 0, 0, 0, 0, 0, 0, 1 / ((theta_max) ** 2), 0, 0, 0],  # theta
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 1 / ((0.1 * thetadot_max) ** 2), 0, 0],  # thetadot
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 / ((psi_max) ** 2), 0],  # psi
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 / ((0.1 * psidot_max) ** 2)]  # psidot
-        ])
-        '''
-        Q = np.diag([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
-        '''
-        R = np.diag([1/((0.05*f_max)**2), 1/((0.05*moment_x_max)**2), 1/((0.05*moment_y_max)**2), 1/((0.05*moment_z_max)**2)])
-
-
-        # A matrix (12x12)
-        A = np.array([
-            [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0, g, 0, 0, 0],
-            [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, -g, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-        ])
-
-        # B matrix (12x4)
-        B = np.array([
-            [0, 0, 0, 0],
-            [0, 0, 0, 0],
-            [0, 0, 0, 0],
-            [0, 0, 0, 0],
-            [0, 0, 0, 0],
-            [1 / m, 0, 0, 0],
-            [0, 0, 0, 0],
-            [0, 1 / I_xx, 0, 0],
-            [0, 0, 0, 0],
-            [0, 0 , 1 / I_yy, 0],
-            [0, 0, 0, 0],
-            [0, 0, 0, 1 / I_zz]
-        ])
-
-
-        self.K, _, _ = control.lqr(A, B, Q, R)
-
-        rx, ry, rz = [xk[0,0]], [xk[2,0]], [xk[4,0]]
-
-        error = []
-
-        found_path = False
-
-        time = 0.0
-        time_step = 0
-        while time_step <= self.MAX_STEPS:
-
-            x_error = xk - xd
-            u = -self.K @ x_error + np.array(ud).reshape(self.M,1)
-
-            # check if LQR control is safe with respect to CBF constraint
-            '''
-            if cbf_check and not test_LQR and not solve_QP:
-                if not self.cbf_rrt_simulation.QP_constraint([x[0, 0] + gx, x[1, 0] + gy, x[2, 0] + gtheta], u,
-                                                             system_type="unicycle_velocity_control"):
-                    break
-            '''
-
-            # Intergrate the nonlinear dynamics
-            xk = odeint(self.drone_nonlinear, xk.reshape(-1), [0, self.DT], args=(u,))[-1].reshape(-1, 1)
-
-            # Normalize angle between -pi and pi
-            #xk[6, 0] = Utils.normalize_angle(xk[6,0])
-            #xk[8, 0] = Utils.normalize_angle(xk[8,0])
-            #xk[10, 0] = Utils.normalize_angle(xk[10,0])
-
-            control_trajectory = np.hstack((control_trajectory, u.reshape(self.M,1)))
-            state_trajectory = np.hstack((state_trajectory, xk.reshape(self.N,1)))
-            time += self.DT
-            time_step += 1
-
-            rx.append(xk[0, 0])
-            ry.append(xk[2, 0])
-            rz.append(xk[4, 0])
-
-            d = math.sqrt((goal_state[0] - rx[-1]) ** 2 + (goal_state[2] - ry[-1]) ** 2 + (goal_state[4] - rz[-1]) ** 2)
-            error.append(d)
-
-            if d <= self.GOAL_DIST:
-                found_path = True
-                # print('errors ', d)
-                break
-
-            # animation
-            if show_animation:  # pragma: no cover
-                # for stopping simulation with the esc key.
-
-                plt.gcf().canvas.mpl_connect('key_release_event',
-                                             lambda event: [exit(0) if event.key == 'escape' else None])
-                #plt.plot(sx, sy, sz, "or")
-                #plt.plot(gx, gy, gz,"ob")
-                plt.plot(rx, ry, rz,"-r")
-                plt.axis("equal")
-                plt.pause(1.0)
-
-        if not found_path:
-            # print("Cannot found path")
-            return rx, ry, rz, error, found_path
-
-        return rx, ry, rz, error, state_trajectory, found_path
-
-
-    def get_linear_model(self, x_bar, u_bar):
-        """
-        Computes the LTI approximated state space model x' = Ax + Bu
-
-        State Space dimension 12 x 1
-
-        x^T = [x, x_dot, y, y_dot, z, z_dot, phi, phi_dot, theta, theta_dot, psi, psi_dot]
-
-        We change the notation to be (equivalent to the above)
-        x^T = [x1, x2, y1, y2, z1, z2, phi1, phi2, theta1, theta2, psi1, psi2]
-
-        F      - 1 x 1, thrust output in z direction
-        M      - 3 x 1, [\tau_x, \tau_y, \tau_z] moments output
-
-        Control Space dimension 4 x 1
-        u^T = [F,M]
-
-        """
-
-        x1 = x_bar[0]
-        x2 = x_bar[1]
-        y1 = x_bar[2]
-        y2 = x_bar[3]
-        z1 = x_bar[4]
-        z2 = x_bar[5]
-        phi1 = x_bar[6]
-        phi2 = x_bar[7]
-        theta1 = x_bar[8]
-        theta2 = x_bar[9]
-        psi1 = x_bar[10]
-        psi2 = x_bar[11]
-
-        F = u_bar[0]
-        M_x = u_bar[1]
-        M_y = u_bar[2]
-        M_z = u_bar[3]
-
-        # Drone parameters
-        m = 0.028  # mass in kg
-        g = 9.81  # gravity
-        I_xx = 16.571710e-6  # Moment of inertia around x-axis
-        I_yy = 16.655602e-6  # Moment of inertia around y-axis
-        I_zz = 29.261652e-6  # Moment of inertia around z-axis
-
-        # A matrix (12x12)
-        A = np.array([
-            [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0, g, 0, 0, 0],
-            [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, -g, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-        ])
-
-        # B matrix (12x4)
-        B = np.array([
-            [0, 0, 0, 0],
-            [0, 0, 0, 0],
-            [0, 0, 0, 0],
-            [0, 0, 0, 0],
-            [0, 0, 0, 0],
-            [1/m, 0, 0, 0],
-            [0, 0, 0, 0],
-            [0, 1/I_xx, 0, 0],
-            [0, 0, 0, 0],
-            [0, 1/I_yy, 0, 0],
-            [0, 0, 0, 0],
-            [0, 0, 1/I_zz, 0]
-        ])
-
-
-        A_lin = np.eye(self.N) + self.DT * A
-
-        B_lin = self.DT * B
-
-        f_xu = np.array(
-            [
-                x2,
-                F / m * (np.sin(phi1) * np.sin(psi1) + np.cos(phi1) * np.cos(psi1) * np.sin(theta1)),
-                y2,
-                F / m * (np.cos(phi1) * np.sin(psi1) * np.sin(theta1) - np.cos(psi1) * np.sin(phi1)),
-                z2,
-                -g + F / m * np.cos(phi1) * np.cos(theta1),
-                phi2,
-                (I_yy - I_zz) / I_xx * theta2 * psi2 + M_x / I_xx,
-                theta2,
-                (I_zz - I_xx) / I_yy * phi2 * psi2 + M_y / I_yy,
-                psi2,
-                (I_xx - I_yy) / I_zz * phi2 * theta2 + M_z / I_zz]
-        ).reshape(self.N, 1)
-
-        C_lin = self.DT * (
-                f_xu - np.dot(A, x_bar.reshape(self.N, 1)) - np.dot(B, u_bar.reshape(self.M, 1))
-        )
-
-        return np.round(A_lin, 4), np.round(B_lin, 4), np.round(C_lin, 4)
-
-
+import control
+import matplotlib.pyplot as plt
+from dataclasses import dataclass
+
+@dataclass
+class DroneParams:
+   mass: float = 0.028
+   gravity: float = 9.81
+   I_xx: float = 16.571710e-6
+   I_yy: float = 16.655602e-6
+   I_zz: float = 29.261652e-6
+
+class LQRController:
+   def __init__(self):
+       self.drone = DroneParams()
+       self.N = 12  # state dimension
+       self.M = 4   # control dimension
+       
+       self.A = np.array([
+           [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],  # phi
+           [0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],  # theta
+           [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],  # psi
+           [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # p
+           [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # q 
+           [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # r
+           [0, self.drone.gravity, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # x_dot
+           [-self.drone.gravity, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # y_dot
+           [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # z_dot
+           [0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],  # x
+           [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],  # y
+           [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],  # z
+       ])
+
+       self.B = np.array([
+           [0, 0, 0, 0],
+           [0, 0, 0, 0],
+           [0, 0, 0, 0],
+           [0, 1/self.drone.I_xx, 0, 0],
+           [0, 0, 1/self.drone.I_yy, 0],
+           [0, 0, 0, 1/self.drone.I_zz],
+           [0, 0, 0, 0],
+           [0, 0, 0, 0],
+           [1/self.drone.mass, 0, 0, 0],
+           [0, 0, 0, 0],
+           [0, 0, 0, 0],
+           [0, 0, 0, 0],
+       ])
+       
+       # LQR gains
+       self.Q = np.diag([100, 100, 100, 10, 10, 10, 10, 10, 10, 1, 1, 1])
+       self.R = np.diag([0.1, 0.1, 0.1, 0.1])
+       self.K, _, _ = control.lqr(self.A, self.B, self.Q, self.R)
+
+   def get_control(self, current_state, goal_state):
+       x_error = current_state.reshape(self.N, 1) - goal_state.reshape(self.N, 1)
+       ud = np.array([[self.drone.mass * self.drone.gravity, 0, 0, 0]]).T
+       u = -self.K @ x_error + ud
+       return u.flatten()
+
+class DroneSimulation:
+   def __init__(self):
+       self.drone = DroneParams()
+       self.dt = 0.02
+       self.fig = plt.figure()
+       self.ax = self.fig.add_subplot(111, projection='3d')
+       self.states_history = []
+
+   def dynamics(self, x, t, u):
+       phi, theta, psi, p, q, r, vx, vy, vz, x_pos, y_pos, z_pos = x
+       ft, tau_x, tau_y, tau_z = u
+
+       c_phi = np.cos(phi)
+       s_phi = np.sin(phi)
+       c_theta = np.cos(theta)
+       s_theta = np.sin(theta)
+       c_psi = np.cos(psi)
+       s_psi = np.sin(psi)
+       t_theta = np.tan(theta)
+
+       dx = np.zeros(12)
+       # Angular velocities
+       dx[0] = p + q * s_phi * t_theta + r * c_phi * t_theta
+       dx[1] = q * c_phi - r * s_phi
+       dx[2] = q * s_phi / c_theta + r * c_phi / c_theta
+
+       # Angular accelerations
+       dx[3] = ((self.drone.I_yy - self.drone.I_zz) * q * r) / self.drone.I_xx + tau_x / self.drone.I_xx
+       dx[4] = ((self.drone.I_zz - self.drone.I_xx) * p * r) / self.drone.I_yy + tau_y / self.drone.I_yy
+       dx[5] = ((self.drone.I_xx - self.drone.I_yy) * p * q) / self.drone.I_zz + tau_z / self.drone.I_zz
+
+       # Linear velocities
+       dx[6] = (c_phi * s_theta * c_psi + s_phi * s_psi) * ft / self.drone.mass
+       dx[7] = (c_phi * s_theta * s_psi - s_phi * c_psi) * ft / self.drone.mass
+       dx[8] = -self.drone.gravity + (c_phi * c_theta) * ft / self.drone.mass
+
+       # Positions
+       dx[9] = vx
+       dx[10] = vy
+       dx[11] = vz
+
+       return dx
+
+   def step(self, state, action):
+       next_state = odeint(self.dynamics, state, [0, self.dt], args=(action,))[-1]
+       self.states_history.append(next_state.copy())
+       return next_state
+
+   def render(self, state):
+    self.ax.clear()
+    
+    phi, theta, psi = state[0:3]
+    x, y, z = state[9:12]
+    
+    # Plot drone position
+    self.ax.scatter(x, y, z, c="r", marker="o", s=1)
+    
+    # X configuration arms
+    arm_length = 0.3
+    arms = np.array([
+        [arm_length/np.sqrt(2), arm_length/np.sqrt(2), 0],
+        [-arm_length/np.sqrt(2), -arm_length/np.sqrt(2), 0],
+        [arm_length/np.sqrt(2), -arm_length/np.sqrt(2), 0],
+        [-arm_length/np.sqrt(2), arm_length/np.sqrt(2), 0]
+    ])
+    
+    # Rotation matrix
+    Rx = np.array([[1, 0, 0],
+                   [0, np.cos(phi), -np.sin(phi)],
+                   [0, np.sin(phi), np.cos(phi)]])
+    
+    Ry = np.array([[np.cos(theta), 0, np.sin(theta)],
+                   [0, 1, 0],
+                   [-np.sin(theta), 0, np.cos(theta)]])
+    
+    Rz = np.array([[np.cos(psi), -np.sin(psi), 0],
+                   [np.sin(psi), np.cos(psi), 0], 
+                   [0, 0, 1]])
+    
+    R = Rz @ Ry @ Rx
+    arms_rotated = np.dot(arms, R.T) + np.array([x, y, z])
+    
+    # Draw X configuration
+    for i in range(0, 4, 2):
+        self.ax.plot([arms_rotated[i][0], arms_rotated[i+1][0]],
+                    [arms_rotated[i][1], arms_rotated[i+1][1]], 
+                    [arms_rotated[i][2], arms_rotated[i+1][2]], c="b")
+        self.ax.plot([arms_rotated[i+1][0], arms_rotated[(i+2)%4][0]],
+                    [arms_rotated[i+1][1], arms_rotated[(i+2)%4][1]],
+                    [arms_rotated[i+1][2], arms_rotated[(i+2)%4][2]], c="b")
+    
+    self.ax.set_xlim([-5, 5])
+    self.ax.set_ylim([-5, 5]) 
+    self.ax.set_zlim([0, 5])
+    
+    plt.draw()
+    plt.pause(0.02)
 
 def main():
-    print(__file__ + " start!!")
-
-    max_steps = 100
-
-    gx = 1.0
-    gy = 0.5
-    gz = 1.2
-
-
-    lqr_planner = LQRPlanner()
-
-    sx, sy, sz = 0.0, 0.0, 0.0
-    initial_state = [sx,0.0,sy,0.0,sz,0.0,0.0,0.0,0.0,0.0,0.0,0.0]
-    goal_state = [gx, 0.0, gy, 0.0, gz, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-
-
-    start_time = time.time()
-
-    print("goal", gy, gx, gz)
-
-
-    rx, ry, rz, error, state_traj, foundpath = lqr_planner.lqr_planning(initial_state, goal_state, LQR_gain=None, test_LQR=True,
-                                                                show_animation=SHOW_ANIMATION)
-
-
-    print("time of running LQR: ", time.time() - start_time)
-    print("Found path: ", foundpath)
-
-
-    
-    
-    ax = plt.axes(projection='3d')
-    ax.plot(sx, sy, sz, "or")
-    ax.plot(gx, gy, gz, "ob")
-    ax.plot(rx, ry, rz, "-r")
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('Z')
-    ax.set_xlim(-1.5, 2.5)
-    ax.set_ylim(-2.5, 2.5)
-    ax.set_zlim(-5, 5)
-
-    plt.show()
-    '''
-
-    ax = plt.axes()
-    t = np.linspace(0, lqr_planner.MAX_TIME, len(rx))
-    ax.plot(t, rx, label="x")
-    ax.plot(t, ry, label="y")
-    ax.plot(t, rz, label="z")
-    plt.show()
-
-    '''
-
-    '''
-        
-        ax1.plot(sx, sy, "or")
-        ax1.plot(gx, gy, "ob")
-        ax1.plot(rx, ry, "-r")
-        ax1.grid()
-
-        ax2.plot(error, label="errors")
-        ax2.legend(loc='upper right')
-        ax2.grid()
-        plt.show()
-
-        if SHOW_ANIMATION:  # pragma: no cover
-            plt.plot(sx, sy, "or")
-            plt.plot(gx, gy, "ob")
-            plt.plot(rx, ry, "-r")
-            plt.axis("equal")
-            plt.pause(1.0)
-    '''
+   controller = LQRController()
+   sim = DroneSimulation()
+   
+   current_state = np.zeros(12)
+   goal_state = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 3.0, 2.5])
+   
+   for _ in range(500):
+       # Get control action
+       u = controller.get_control(current_state, goal_state)
+       
+       # Simulate one step
+       current_state = sim.step(current_state, u)
+       
+       # Render
+       sim.render(current_state)
+       
+       # Check convergence
+       if np.linalg.norm(current_state[9:12] - goal_state[9:12]) < 0.5:
+           print("Reached goal!")
+           break
+           
+   plt.show()
 
 if __name__ == '__main__':
-    main()
+   main()
